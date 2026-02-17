@@ -28,9 +28,6 @@ My work sits at the intersection of spatial analysis, climate adaptation policy,
 
 ### Code
 
-- ArcPy workflow automation scripts developed for the Edmonds Climate Advisory Board
-- Python scripts for tree canopy detection using Detectree2 and high-resolution aerial imagery
-- Python statistical analysis pipeline for microplastic field research (pandas, scipy, statsmodels, seaborn)
 - DuckDB/Python pipeline for processing large-scale campaign finance data (~100 GB uncompressed), including Parquet conversion, identity resolution, and geospatial filtering against Washington State boundaries
 
 ---
