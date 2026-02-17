@@ -1,0 +1,271 @@
+"""
+wa_contributions.py
+-------------------
+Processes DIME campaign finance data (2006–2024) for Washington State individual donors.
+
+For each biennial election cycle, this script:
+  - Reads a Parquet file of itemized contributions
+  - Filters to WA individual donors with valid geocoordinates
+  - Resolves each donor to their most recent address in the cycle
+  - Aggregates total contributions and unique recipient counts per donor
+  - Winsorizes total amounts at the 99th percentile
+  - Spatially filters results to the WA state boundary
+
+Output: wa_contributions_all_years.csv
+
+Data source: DIME (Database on Ideology, Money in Politics, and Elections)
+             Stanford Social Science Data Collection — Adam Bonica
+             https://data.stanford.edu/dime
+"""
+
+import os
+import time
+import logging
+
+import duckdb
+import pandas as pd
+import geopandas as gpd
+from shapely.geometry import Point
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+PARQUET_DIR       = r'D:\Contributor_Data'
+OUTPUT_DIR        = r'D:\Contributor_Data\Output'
+TEMP_DIR          = r'D:\Contributor_Data\DuckDB_Temp'
+WA_SHAPEFILE_PATH = r'D:\Contributor_Data\State Boundry\WA_State_Boundary.shp'
+FINAL_CSV_PATH    = os.path.join(OUTPUT_DIR, 'wa_contributions_all_years.csv')
+
+ELECTION_CYCLES   = range(2006, 2026, 2)   # biennial cycles
+DUCKDB_THREADS    = 6
+DUCKDB_MEMORY     = '60GB'
+WINSORIZE_PCTILE  = 0.99
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s  %(levelname)-8s  %(message)s',
+    datefmt='%H:%M:%S',
+)
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Per-cycle processing
+# ---------------------------------------------------------------------------
+
+def process_cycle(year: int) -> pd.DataFrame | None:
+    """
+    Load, filter, and aggregate DIME contribution data for one election cycle.
+
+    Parameters
+    ----------
+    year : int
+        The first year of the biennial cycle (e.g. 2020 covers 2019-2020).
+
+    Returns
+    -------
+    pd.DataFrame or None
+        Aggregated donor-level records, or None if the Parquet file is missing.
+    """
+    parquet_file = os.path.join(PARQUET_DIR, f'contribDB_{year}.parquet')
+    duckdb_file  = os.path.join(OUTPUT_DIR,  f'wa_contributions_{year}.duckdb')
+
+    if not os.path.exists(parquet_file):
+        log.warning(f'Cycle {year}: Parquet file not found, skipping.')
+        return None
+
+    log.info(f'Cycle {year}: starting.')
+    t0 = time.time()
+
+    con = duckdb.connect(duckdb_file)
+    con.execute(f'PRAGMA threads={DUCKDB_THREADS};')
+    con.execute(f"SET temp_directory = '{TEMP_DIR}';")
+    con.execute('SET preserve_insertion_order = false;')
+    con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY}';")
+
+    try:
+        con.execute('BEGIN TRANSACTION;')
+        con.execute(f'DROP TABLE IF EXISTS wa_contributions_{year};')
+
+        # --- Step 1: filter raw contributions to WA individual donors ----------
+        con.execute(f"""
+            CREATE TEMPORARY TABLE temp_wa_contributions AS
+            SELECT
+                LOWER("bonica.cid")          AS bonica_cid,
+                "bonica.rid"                 AS bonica_rid,
+                "contributor.gender"         AS gender,
+                "contributor.employer"       AS employer,
+                "contributor.name"           AS fullname,
+                "contributor.address"        AS address,
+                "contributor.city"           AS city,
+                "contributor.zipcode"        AS zip,
+                CAST("amount" AS DOUBLE)     AS amount,
+                "recipient.state"            AS recipient_state,
+                "latitude",
+                "longitude",
+                "cycle"                      AS original_cycle,
+                "date",
+                "is.corp"                    AS is_corp,
+                "contributor.cfscore"        AS contributor_cfscore
+            FROM read_parquet('{parquet_file}')
+            WHERE "contributor.state"  = 'WA'
+              AND "contributor.type"   = 'I'
+              AND "latitude"           IS NOT NULL
+              AND "longitude"          IS NOT NULL
+              AND CAST("amount" AS DOUBLE) > 0
+        """)
+
+        # --- Step 2: build final aggregated table per donor -------------------
+        #
+        # Donor location is taken from their most recent transaction in the
+        # cycle (handles address changes mid-cycle).
+        con.execute(f"""
+            CREATE TABLE wa_contributions_{year} AS
+            WITH
+            -- Most recent address per donor
+            latest_locations AS (
+                SELECT
+                    bonica_cid,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY bonica_cid
+                        ORDER BY "date" DESC
+                    )                AS row_num,
+                    latitude,
+                    longitude,
+                    "date"           AS latest_date,
+                    address,
+                    city,
+                    zip
+                FROM temp_wa_contributions
+            ),
+            latest_locs AS (
+                SELECT * FROM latest_locations WHERE row_num = 1
+            ),
+            -- Number of distinct recipients supported
+            recipient_counts AS (
+                SELECT
+                    bonica_cid,
+                    COUNT(DISTINCT bonica_rid) AS unique_recipient_count
+                FROM temp_wa_contributions
+                GROUP BY bonica_cid
+            ),
+            -- Total dollars donated in the cycle
+            amount_totals AS (
+                SELECT
+                    bonica_cid,
+                    SUM(amount) AS total_amount
+                FROM temp_wa_contributions
+                GROUP BY bonica_cid
+            )
+            SELECT
+                t.bonica_cid,
+                l.latitude,
+                l.longitude,
+                l.latest_date,
+                l.address,
+                l.city,
+                l.zip,
+                a.total_amount,
+                r.unique_recipient_count,
+                MAX(t.gender)              AS gender,
+                MAX(t.employer)            AS employer,
+                MAX(t.fullname)            AS fullname,
+                CAST('{year}-01-01' AS DATE) AS cycle_date,
+                MAX(t.original_cycle)      AS original_cycle,
+                CAST('{year}' AS VARCHAR)  AS cycle,
+                MAX(t.is_corp)             AS is_corp,
+                MAX(t.contributor_cfscore) AS contributor_cfscore
+            FROM temp_wa_contributions t
+            JOIN latest_locs       l ON t.bonica_cid = l.bonica_cid
+            JOIN recipient_counts  r ON t.bonica_cid = r.bonica_cid
+            JOIN amount_totals      a ON t.bonica_cid = a.bonica_cid
+            GROUP BY
+                t.bonica_cid,
+                l.latitude, l.longitude, l.latest_date,
+                l.address,  l.city,      l.zip,
+                a.total_amount,
+                r.unique_recipient_count
+        """)
+
+        df = con.execute(f'SELECT * FROM wa_contributions_{year}').fetchdf()
+        con.execute('DROP TABLE temp_wa_contributions;')
+        con.execute('COMMIT;')
+
+    except Exception as exc:
+        con.execute('ROLLBACK;')
+        log.error(f'Cycle {year}: transaction failed — {exc}')
+        raise
+    finally:
+        con.close()
+
+    elapsed = time.time() - t0
+    log.info(f'Cycle {year}: {len(df):,} donors loaded in {elapsed:.1f}s.')
+    return df
+
+# ---------------------------------------------------------------------------
+# Post-processing
+# ---------------------------------------------------------------------------
+
+def clean_combined(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove zero/negative amounts and winsorize at the 99th percentile."""
+    df = df[df['total_amount'] > 0].copy()
+    cap = df['total_amount'].quantile(WINSORIZE_PCTILE)
+    df.loc[df['total_amount'] > cap, 'total_amount'] = cap
+    log.info(f'After cleaning: {len(df):,} donors. Winsorize cap: ${cap:,.0f}.')
+    return df
+
+
+def spatial_filter(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Retain only donors whose geocoded address falls within the WA state boundary.
+
+    Falls back to the unfiltered DataFrame if the shapefile cannot be loaded.
+    """
+    try:
+        wa_shape = gpd.read_file(WA_SHAPEFILE_PATH)
+        geometry = [Point(xy) for xy in zip(df['longitude'], df['latitude'])]
+        gdf = gpd.GeoDataFrame(df, geometry=geometry, crs='EPSG:4326')
+        wa_boundary = wa_shape.unary_union
+        gdf['in_washington'] = gdf.geometry.within(wa_boundary)
+        filtered = gdf[gdf['in_washington']].drop(columns=['geometry', 'in_washington'])
+        log.info(f'Spatial filter: {len(filtered):,} of {len(df):,} donors inside WA boundary.')
+        return filtered
+    except Exception as exc:
+        log.warning(f'Spatial filter failed ({exc}). Saving unfiltered data.')
+        return df
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(TEMP_DIR,   exist_ok=True)
+
+    # Process each cycle and collect results
+    frames = []
+    for year in ELECTION_CYCLES:
+        df = process_cycle(year)
+        if df is not None:
+            frames.append(df)
+
+    if not frames:
+        log.error('No data was processed. Check that Parquet files exist in PARQUET_DIR.')
+        return
+
+    combined = pd.concat(frames, ignore_index=True)
+    log.info(f'Combined dataset: {len(combined):,} rows across {len(frames)} cycles.')
+
+    combined = clean_combined(combined)
+    combined = spatial_filter(combined)
+
+    combined.to_csv(FINAL_CSV_PATH, index=False)
+    log.info(f'Output saved to {FINAL_CSV_PATH}.')
+
+
+if __name__ == '__main__':
+    main()
