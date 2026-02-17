@@ -39,5 +39,5 @@ My work sits at the intersection of spatial analysis, climate adaptation policy,
 
 ## Contact
 
-- Email: EMAIL
-- LinkedIn: LINKEDIN URL
+- Email: KAMERON4321@GMAIL.COM
+- LinkedIn: https://www.linkedin.com/in/eckkam11/
